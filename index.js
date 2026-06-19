@@ -157,5 +157,127 @@ Contesto dati: ${context || 'nessun contesto fornito'}`
   }
 });
 
+// ===== NUOVO: Endpoint per elencare i file da Google Drive =====
+app.get('/api/drive/files', async (req, res) => {
+  try {
+    console.log('--> Richiesta lista file Drive');
+    
+    const response = await drive.files.list({
+      pageSize: 50,
+      fields: 'files(id, name, mimeType, size, modifiedTime)',
+      orderBy: 'modifiedTime desc',
+    });
+    
+    console.log(`--> Trovati ${response.data.files?.length || 0} file`);
+    
+    res.json({ 
+      success: true, 
+      files: response.data.files || [] 
+    });
+    
+  } catch (error) {
+    console.error('Errore lista file Drive:', error.message);
+    
+    // Se l'error è di autenticazione, diamo un messaggio più chiaro
+    if (error.message.includes('invalid_grant')) {
+      return res.status(401).json({ 
+        success: false, 
+        error: 'Refresh token Google non valido o scaduto. Rigeneralo su https://developers.google.com/oauthplayground' 
+      });
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// ===== NUOVO: Endpoint per scaricare un file da Google Drive =====
+app.get('/api/drive/download/:fileId', async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    
+    console.log(`--> Download file Drive: ${fileId}`);
+    
+    // Prima prendi i metadati per sapere nome e tipo
+    const metadata = await drive.files.get({
+      fileId: fileId,
+      fields: 'name, mimeType, size',
+    });
+    
+    const fileName = metadata.data.name || 'file';
+    const mimeType = metadata.data.mimeType || 'application/octet-stream';
+    
+    console.log(`--> Scaricando: ${fileName} (${mimeType})`);
+    
+    // Poi scarica il contenuto
+    const file = await drive.files.get(
+      { fileId: fileId, alt: 'media' },
+      { responseType: 'stream' }
+    );
+    
+    // Imposta gli header per il download
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    
+    // Invia il file
+    file.data.pipe(res);
+    
+  } catch (error) {
+    console.error('Errore download file:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// ===== NUOVO: Endpoint per ottenere info su un file specifico =====
+app.get('/api/drive/info/:fileId', async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    
+    const response = await drive.files.get({
+      fileId: fileId,
+      fields: 'id, name, mimeType, size, modifiedTime, webViewLink',
+    });
+    
+    res.json({ 
+      success: true, 
+      file: response.data 
+    });
+    
+  } catch (error) {
+    console.error('Errore info file:', error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// ===== Health check =====
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    google: {
+      clientId: CLIENT_ID ? 'configurato' : 'mancante',
+      clientSecret: CLIENT_SECRET ? 'configurato' : 'mancante',
+      refreshToken: REFRESH_TOKEN ? 'configurato' : 'mancante',
+    }
+  });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server attivo sulla porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ Server attivo sulla porta ${PORT}`);
+  console.log(`✅ Endpoint disponibili:`);
+  console.log(`   - POST /api/genera`);
+  console.log(`   - POST /api/ask`);
+  console.log(`   - GET  /api/drive/files`);
+  console.log(`   - GET  /api/drive/download/:fileId`);
+  console.log(`   - GET  /api/drive/info/:fileId`);
+  console.log(`   - GET  /health`);
+});
