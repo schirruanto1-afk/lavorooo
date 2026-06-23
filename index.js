@@ -9,7 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ===== Credenziali Google (default - le tue) =====
+// ===== Credenziali Google =====
 const CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
@@ -21,35 +21,104 @@ oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
 const drive = google.drive({ version: 'v3', auth: oauth2Client });
 const docs  = google.docs({  version: 'v1', auth: oauth2Client });
 
+// Token temporaneo per utente loggato
+let userTokens = null;
+
 // ===== Client Groq =====
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// ===== LOG DIAGNOSTICO =====
-function maschera(v) {
-  if (!v) return 'MANCANTE';
-  return 'lunghezza=' + v.length + ', inizio="' + v.slice(0, 6) + '...", fine="...' + v.slice(-6) + '"';
-}
-console.log('--- DIAGNOSTICA CREDENZIALI ---');
-console.log('GOOGLE_CLIENT_ID:', maschera(CLIENT_ID));
-console.log('GOOGLE_CLIENT_SECRET:', maschera(CLIENT_SECRET));
-console.log('GOOGLE_REFRESH_TOKEN:', maschera(REFRESH_TOKEN));
-console.log('GROQ_API_KEY:', maschera(process.env.GROQ_API_KEY));
-console.log('-------------------------------');
+// ===== LOG =====
+console.log('--- AVVIO SERVER ---');
+console.log('Google Client ID:', CLIENT_ID ? 'OK' : 'MANCANTE');
+console.log('Google Refresh Token:', REFRESH_TOKEN ? 'OK' : 'MANCANTE');
+console.log('Groq API Key:', process.env.GROQ_API_KEY ? 'OK' : 'MANCANTE');
+console.log('-------------------');
 
 // ==========================================
-// GOOGLE DRIVE - LISTA FILE
+// LOGIN GOOGLE - SCEGLI ACCOUNT
+// ==========================================
+app.get('/api/google/login', (req, res) => {
+  const authClient = new google.auth.OAuth2(
+    CLIENT_ID,
+    CLIENT_SECRET,
+    'https://studio-backend-kzx7.onrender.com/api/google/callback-web'
+  );
+  
+  const authUrl = authClient.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: [
+      'https://www.googleapis.com/auth/drive.readonly',
+      'https://www.googleapis.com/auth/documents',
+    ],
+  });
+  
+  res.redirect(authUrl);
+});
+
+// ==========================================
+// CALLBACK DOPO LOGIN
+// ==========================================
+app.get('/api/google/callback-web', async (req, res) => {
+  const { code } = req.query;
+  
+  if (!code) {
+    return res.send('<h1 style="color:red;">Errore: codice mancante</h1>');
+  }
+  
+  try {
+    const authClient = new google.auth.OAuth2(
+      CLIENT_ID,
+      CLIENT_SECRET,
+      'https://studio-backend-kzx7.onrender.com/api/google/callback-web'
+    );
+    
+    const { tokens } = await authClient.getToken(code);
+    
+    // Salva i token dell'utente
+    userTokens = tokens;
+    
+    const userAuth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
+    userAuth.setCredentials(tokens);
+    const userDrive = google.drive({ version: 'v3', auth: userAuth });
+    const files = await userDrive.files.list({ pageSize: 20, fields: 'files(name)' });
+    
+    const fileList = (files.data.files || []).map(f => '<li>📄 ' + f.name + '</li>').join('');
+    
+    res.send(
+      '<html><head><style>body{font-family:sans-serif;padding:30px;text-align:center;}ul{text-align:left;max-width:400px;margin:20px auto;}</style></head>' +
+      '<body>' +
+      '<h1 style="color:green;">✅ Collegato al tuo Google Drive!</h1>' +
+      '<p>I tuoi file:</p>' +
+      '<ul>' + (fileList || '<li>Nessun file trovato</li>') + '</ul>' +
+      '<p style="margin-top:30px;color:#666;">Ora puoi chiudere questa finestra e cliccare di nuovo su ☁️ Drive nell\'app.</p>' +
+      '<button onclick="window.close()" style="padding:12px 30px;background:#4285F4;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer;">✅ Fatto! Chiudi</button>' +
+      '</body></html>'
+    );
+  } catch (error) {
+    res.send('<h1 style="color:red;">Errore</h1><p>' + error.message + '</p>');
+  }
+});
+
+// ==========================================
+// LISTA FILE DRIVE (utente loggato o default)
 // ==========================================
 app.get('/api/drive/files', async (req, res) => {
   try {
-    console.log('--> Lista file Drive');
+    let driveClient = drive; // default: il tuo
     
-    const response = await drive.files.list({
+    // Se c'è un utente loggato, usa il suo
+    if (userTokens) {
+      const userAuth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
+      userAuth.setCredentials(userTokens);
+      driveClient = google.drive({ version: 'v3', auth: userAuth });
+    }
+    
+    const response = await driveClient.files.list({
       pageSize: 50,
       fields: 'files(id, name, mimeType, size, modifiedTime, webViewLink)',
       orderBy: 'modifiedTime desc',
     });
-    
-    console.log('--> Trovati', response.data.files?.length || 0, 'file');
     
     res.json({ 
       success: true, 
@@ -57,78 +126,49 @@ app.get('/api/drive/files', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('Errore lista file Drive:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ==========================================
-// GOOGLE DRIVE - SCARICA FILE
+// SCARICA FILE
 // ==========================================
 app.get('/api/drive/download/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
-    console.log('--> Download file:', fileId);
     
-    const metadata = await drive.files.get({
+    let driveClient = drive;
+    if (userTokens) {
+      const userAuth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
+      userAuth.setCredentials(userTokens);
+      driveClient = google.drive({ version: 'v3', auth: userAuth });
+    }
+    
+    const metadata = await driveClient.files.get({
       fileId: fileId,
-      fields: 'name, mimeType, size',
+      fields: 'name, mimeType',
     });
     
-    const fileName = metadata.data.name || 'file';
-    const mimeType = metadata.data.mimeType || 'application/octet-stream';
-    
-    console.log('--> File:', fileName, '(', mimeType, ')');
-    
-    const file = await drive.files.get(
-      { fileId: fileId, alt: 'media' },
+    const file = await driveClient.files.get(
+      { fileId, alt: 'media' },
       { responseType: 'stream' }
     );
     
-    res.setHeader('Content-Type', mimeType);
-    res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(fileName) + '"');
-    
+    res.setHeader('Content-Type', metadata.data.mimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(metadata.data.name || 'file') + '"');
     file.data.pipe(res);
     
   } catch (error) {
-    console.error('Errore download file:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ==========================================
-// GOOGLE DRIVE - CALLBACK WEB (per cambiare account)
+// LOGOUT (torna al drive default)
 // ==========================================
-app.get('/api/google/callback-web', async (req, res) => {
-  const { code } = req.query;
-  
-  if (!code) {
-    return res.send('<h1>Errore: codice mancante</h1><p>Torna indietro e riprova.</p>');
-  }
-  
-  try {
-    const authClient = new google.auth.OAuth2(
-      CLIENT_ID, 
-      CLIENT_SECRET,
-      'https://studio-backend-kzx7.onrender.com/api/google/callback-web'
-    );
-    
-    const { tokens } = await authClient.getToken(code);
-    
-    res.send(
-      '<html>' +
-      '<body style="font-family:sans-serif;padding:30px;text-align:center;">' +
-      '<h1 style="color:green;">✅ Google Drive collegato!</h1>' +
-      '<p>Copia questo valore nel file <code>.env</code> del backend:</p>' +
-      '<pre style="background:#f5f5f5;padding:15px;border-radius:8px;text-align:left;max-width:600px;margin:0 auto;word-break:break-all;">GOOGLE_REFRESH_TOKEN=' + tokens.refresh_token + '</pre>' +
-      '<p style="color:#666;margin-top:20px;">Poi riavvia il server su Render.</p>' +
-      '<button onclick="window.close()" style="padding:10px 20px;background:#4285F4;color:white;border:none;border-radius:5px;cursor:pointer;font-size:16px;">Chiudi finestra</button>' +
-      '</body>' +
-      '</html>'
-    );
-  } catch (error) {
-    res.send('<h1 style="color:red;">Errore</h1><p>' + error.message + '</p>');
-  }
+app.get('/api/google/logout', (req, res) => {
+  userTokens = null;
+  res.json({ success: true, message: 'Tornato al Drive predefinito' });
 });
 
 // ==========================================
@@ -139,70 +179,43 @@ app.post('/api/genera', async (req, res) => {
     const { paziente, richiesta } = req.body;
 
     if (!paziente || !paziente.nome || !paziente.cognome) {
-      return res.status(400).json({ success: false, error: 'Dati paziente mancanti (nome/cognome).' });
+      return res.status(400).json({ success: false, error: 'Dati paziente mancanti.' });
     }
 
-    const richiestaFinale = richiesta?.trim() ||
-      'Genera una cartella clinica completa con sezioni per anamnesi, diagnosi, obiettivi terapeutici e note di seduta';
-
-    console.log('--> Richiesta per', paziente.nome, paziente.cognome, ':', richiestaFinale);
+    const richiestaFinale = richiesta?.trim() || 'Genera una cartella clinica completa';
 
     const completion = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       messages: [
         {
           role: 'system',
-          content: 'Sei un assistente che aiuta uno psicoterapeuta a redigere documenti clinici professionali in italiano. Scrivi in modo chiaro, professionale e clinicamente appropriato. Non inventare informazioni cliniche specifiche non fornite: se mancano dati, lascia segnaposto tra parentesi quadre (es. [da completare]). Restituisci SOLO il testo del documento, senza markdown, senza intestazioni tipo "Ecco il documento", pronto per essere inserito in un Google Doc.'
+          content: 'Sei un assistente che aiuta uno psicoterapeuta a redigere documenti clinici professionali in italiano. Restituisci SOLO il testo del documento, senza markdown.'
         },
         {
           role: 'user',
-          content: 'Paziente: ' + paziente.nome + ' ' + paziente.cognome + '\nTipo di terapia: ' + (paziente.tipo_terapia || 'non specificato') + '\nNote generali sul paziente: ' + (paziente.note || 'nessuna nota disponibile') + '\n\nRichiesta dello specialista: ' + richiestaFinale
+          content: 'Paziente: ' + paziente.nome + ' ' + paziente.cognome + '\nTerapia: ' + (paziente.tipo_terapia || 'N/D') + '\nNote: ' + (paziente.note || 'N/D') + '\n\nRichiesta: ' + richiestaFinale
         }
       ],
       temperature: 0.4,
       max_tokens: 2048,
     });
 
-    const testoGenerato = completion.choices[0]?.message?.content?.trim();
-
-    if (!testoGenerato) {
-      throw new Error('Groq non ha restituito alcun contenuto.');
-    }
-
-    console.log('--> Testo generato (' + testoGenerato.length + ' caratteri), creo il documento...');
+    const testo = completion.choices[0]?.message?.content?.trim();
+    if (!testo) throw new Error('Nessun contenuto generato');
 
     const nuovoDoc = await docs.documents.create({
-      requestBody: {
-        title: paziente.nome + ' ' + paziente.cognome + ' - ' + new Date().toLocaleDateString('it-IT'),
-      },
+      requestBody: { title: paziente.nome + ' ' + paziente.cognome + ' - ' + new Date().toLocaleDateString('it-IT') },
     });
-
-    const nuovoDocId = nuovoDoc.data.documentId;
 
     await docs.documents.batchUpdate({
-      documentId: nuovoDocId,
-      requestBody: {
-        requests: [
-          {
-            insertText: {
-              location: { index: 1 },
-              text: testoGenerato,
-            },
-          },
-        ],
-      },
+      documentId: nuovoDoc.data.documentId,
+      requestBody: { requests: [{ insertText: { location: { index: 1 }, text: testo } }] },
     });
 
-    const info = await drive.files.get({
-      fileId: nuovoDocId,
-      fields: 'webViewLink',
-    });
-
-    console.log('--> Documento creato:', info.data.webViewLink);
+    const info = await drive.files.get({ fileId: nuovoDoc.data.documentId, fields: 'webViewLink' });
     res.json({ success: true, url: info.data.webViewLink });
 
   } catch (error) {
-    console.error('Errore:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -213,32 +226,22 @@ app.post('/api/genera', async (req, res) => {
 app.post('/api/ask', async (req, res) => {
   try {
     const { query, context } = req.body;
-
-    if (!query || !query.trim()) {
-      return res.status(400).json({ error: 'Campo "query" mancante.' });
-    }
-
-    console.log('--> Domanda AI dashboard:', query);
+    if (!query?.trim()) return res.status(400).json({ error: 'Query mancante.' });
 
     const completion = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       messages: [
-        {
-          role: 'system',
-          content: 'Sei un assistente per uno studio terapeutico. Hai accesso ai dati dei pazienti forniti nel contesto. Rispondi in italiano in modo conciso e utile. Se trovi dati pertinenti, mostrali chiaramente. Contesto dati: ' + (context || 'nessun contesto fornito')
-        },
+        { role: 'system', content: 'Assistente studio terapeutico. Contesto: ' + (context || 'nessuno') },
         { role: 'user', content: query }
       ],
       max_tokens: 500,
       temperature: 0.3,
     });
 
-    const risposta = completion.choices[0]?.message?.content?.trim() ?? 'Nessuna risposta disponibile.';
-    res.json({ answer: risposta });
+    res.json({ answer: completion.choices[0]?.message?.content?.trim() ?? 'Nessuna risposta.' });
 
   } catch (error) {
-    console.error('Errore /api/ask:', error.message);
-    res.status(500).json({ error: error.message, answer: 'Errore nella generazione della risposta.' });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -246,18 +249,8 @@ app.post('/api/ask', async (req, res) => {
 // HEALTH CHECK
 // ==========================================
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    google: {
-      clientId: CLIENT_ID ? 'configurato' : 'mancante',
-      clientSecret: CLIENT_SECRET ? 'configurato' : 'mancante',
-      refreshToken: REFRESH_TOKEN ? 'configurato' : 'mancante',
-    },
-  });
+  res.json({ status: 'ok', userLoggedIn: !!userTokens });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('Server attivo sulla porta ' + PORT);
-});
+app.listen(PORT, () => console.log('Server attivo sulla porta ' + PORT));
