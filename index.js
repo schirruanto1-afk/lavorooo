@@ -4,17 +4,10 @@ const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
 const Groq = require('groq-sdk');
-const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// ===== Supabase =====
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 // ===== Credenziali Google (default - le tue) =====
 const CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
@@ -34,152 +27,23 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 // ===== LOG DIAGNOSTICO =====
 function maschera(v) {
   if (!v) return 'MANCANTE';
-  return `lunghezza=${v.length}, inizio="${v.slice(0, 6)}...", fine="...${v.slice(-6)}"`;
+  return 'lunghezza=' + v.length + ', inizio="' + v.slice(0, 6) + '...", fine="...' + v.slice(-6) + '"';
 }
 console.log('--- DIAGNOSTICA CREDENZIALI ---');
 console.log('GOOGLE_CLIENT_ID:', maschera(CLIENT_ID));
 console.log('GOOGLE_CLIENT_SECRET:', maschera(CLIENT_SECRET));
 console.log('GOOGLE_REFRESH_TOKEN:', maschera(REFRESH_TOKEN));
 console.log('GROQ_API_KEY:', maschera(process.env.GROQ_API_KEY));
-console.log('SUPABASE_URL:', maschera(process.env.SUPABASE_URL));
 console.log('-------------------------------');
 
-// ===== FUNZIONE: Ottieni client Drive per un terapista =====
-async function getDriveClientForTherapist(therapistId) {
-  if (!therapistId) return drive;
-  
-  try {
-    const { data, error } = await supabase
-      .from('therapist_google_tokens')
-      .select('*')
-      .eq('therapist_id', therapistId)
-      .single();
-    
-    if (error || !data) return drive;
-    
-    const userAuth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
-    userAuth.setCredentials({
-      access_token: data.access_token,
-      refresh_token: data.refresh_token,
-    });
-    
-    if (Date.now() >= data.expiry_date) {
-      try {
-        const { credentials } = await userAuth.refreshAccessToken();
-        await supabase.from('therapist_google_tokens').update({
-          access_token: credentials.access_token,
-          expiry_date: credentials.expiry_date,
-        }).eq('therapist_id', therapistId);
-      } catch (e) {
-        console.log('Token scaduto, uso default');
-        return drive;
-      }
-    }
-    
-    return google.drive({ version: 'v3', auth: userAuth });
-  } catch (e) {
-    return drive;
-  }
-}
-
-// ===== ENDPOINT: Auth URL per collegare Drive =====
-app.get('/api/google/auth-url', (req, res) => {
-  const authClient = new google.auth.OAuth2(
-    CLIENT_ID, 
-    CLIENT_SECRET,
-    'https://developers.google.com/oauthplayground' // Redirect URI
-  );
-  
-  const authUrl = authClient.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    scope: [
-      'https://www.googleapis.com/auth/drive.readonly',
-    ],
-  });
-  
-  res.json({ success: true, url: authUrl });
-});
-
-// ===== ENDPOINT: Callback scambio codice =====
-app.post('/api/google/callback', async (req, res) => {
-  try {
-    const { code, therapistId } = req.body;
-    
-    if (!code || !therapistId) {
-      return res.status(400).json({ success: false, error: 'Manca code o therapistId' });
-    }
-    
-    const authClient = new google.auth.OAuth2(
-      CLIENT_ID, 
-      CLIENT_SECRET,
-      'https://developers.google.com/oauthplayground'
-    );
-    
-    const { tokens } = await authClient.getToken(code);
-    
-    await supabase.from('therapist_google_tokens').upsert({
-      therapist_id: therapistId,
-      access_token: tokens.access_token,
-      refresh_token: tokens.refresh_token,
-      expiry_date: tokens.expiry_date || Date.now() + 3600 * 1000,
-      updated_at: new Date(),
-    });
-    
-    console.log('Google Drive collegato per terapista:', therapistId);
-    res.json({ success: true, message: 'Google Drive collegato!' });
-  } catch (error) {
-    console.error('Errore callback:', error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ===== ENDPOINT: Verifica se Drive è collegato =====
-app.get('/api/google/status', async (req, res) => {
-  try {
-    const therapistId = req.query.therapistId;
-    
-    if (!therapistId) {
-      return res.json({ linked: false });
-    }
-    
-    const { data } = await supabase
-      .from('therapist_google_tokens')
-      .select('*')
-      .eq('therapist_id', therapistId)
-      .single();
-    
-    res.json({ linked: !!data });
-  } catch (error) {
-    res.json({ linked: false });
-  }
-});
-
-// ===== ENDPOINT: Scollega Google Drive =====
-app.delete('/api/google/disconnect', async (req, res) => {
-  try {
-    const { therapistId } = req.body;
-    
-    await supabase
-      .from('therapist_google_tokens')
-      .delete()
-      .eq('therapist_id', therapistId);
-    
-    res.json({ success: true, message: 'Google Drive scollegato' });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ===== ENDPOINT: Lista file Drive =====
+// ==========================================
+// GOOGLE DRIVE - LISTA FILE
+// ==========================================
 app.get('/api/drive/files', async (req, res) => {
   try {
-    const therapistId = req.query.therapistId;
-    console.log('--> Lista file Drive - terapista:', therapistId || 'default');
+    console.log('--> Lista file Drive');
     
-    const driveClient = await getDriveClientForTherapist(therapistId);
-    
-    const response = await driveClient.files.list({
+    const response = await drive.files.list({
       pageSize: 50,
       fields: 'files(id, name, mimeType, size, modifiedTime, webViewLink)',
       orderBy: 'modifiedTime desc',
@@ -194,32 +58,19 @@ app.get('/api/drive/files', async (req, res) => {
     
   } catch (error) {
     console.error('Errore lista file Drive:', error.message);
-    
-    if (error.message.includes('invalid_grant')) {
-      return res.status(401).json({ 
-        success: false, 
-        error: 'Token Google scaduto. Ricollega Google Drive dalle impostazioni.' 
-      });
-    }
-    
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ===== ENDPOINT: Scarica file da Drive =====
+// ==========================================
+// GOOGLE DRIVE - SCARICA FILE
+// ==========================================
 app.get('/api/drive/download/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
-    const therapistId = req.query.therapistId;
-    
     console.log('--> Download file:', fileId);
     
-    const driveClient = await getDriveClientForTherapist(therapistId);
-    
-    const metadata = await driveClient.files.get({
+    const metadata = await drive.files.get({
       fileId: fileId,
       fields: 'name, mimeType, size',
     });
@@ -229,7 +80,7 @@ app.get('/api/drive/download/:fileId', async (req, res) => {
     
     console.log('--> File:', fileName, '(', mimeType, ')');
     
-    const file = await driveClient.files.get(
+    const file = await drive.files.get(
       { fileId: fileId, alt: 'media' },
       { responseType: 'stream' }
     );
@@ -241,41 +92,48 @@ app.get('/api/drive/download/:fileId', async (req, res) => {
     
   } catch (error) {
     console.error('Errore download file:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ===== ENDPOINT: Info file =====
-app.get('/api/drive/info/:fileId', async (req, res) => {
+// ==========================================
+// GOOGLE DRIVE - CALLBACK WEB (per cambiare account)
+// ==========================================
+app.get('/api/google/callback-web', async (req, res) => {
+  const { code } = req.query;
+  
+  if (!code) {
+    return res.send('<h1>Errore: codice mancante</h1><p>Torna indietro e riprova.</p>');
+  }
+  
   try {
-    const { fileId } = req.params;
-    const therapistId = req.query.therapistId;
+    const authClient = new google.auth.OAuth2(
+      CLIENT_ID, 
+      CLIENT_SECRET,
+      'https://studio-backend-kzx7.onrender.com/api/google/callback-web'
+    );
     
-    const driveClient = await getDriveClientForTherapist(therapistId);
+    const { tokens } = await authClient.getToken(code);
     
-    const response = await driveClient.files.get({
-      fileId: fileId,
-      fields: 'id, name, mimeType, size, modifiedTime, webViewLink',
-    });
-    
-    res.json({ 
-      success: true, 
-      file: response.data 
-    });
-    
+    res.send(
+      '<html>' +
+      '<body style="font-family:sans-serif;padding:30px;text-align:center;">' +
+      '<h1 style="color:green;">✅ Google Drive collegato!</h1>' +
+      '<p>Copia questo valore nel file <code>.env</code> del backend:</p>' +
+      '<pre style="background:#f5f5f5;padding:15px;border-radius:8px;text-align:left;max-width:600px;margin:0 auto;word-break:break-all;">GOOGLE_REFRESH_TOKEN=' + tokens.refresh_token + '</pre>' +
+      '<p style="color:#666;margin-top:20px;">Poi riavvia il server su Render.</p>' +
+      '<button onclick="window.close()" style="padding:10px 20px;background:#4285F4;color:white;border:none;border-radius:5px;cursor:pointer;font-size:16px;">Chiudi finestra</button>' +
+      '</body>' +
+      '</html>'
+    );
   } catch (error) {
-    console.error('Errore info file:', error.message);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
+    res.send('<h1 style="color:red;">Errore</h1><p>' + error.message + '</p>');
   }
 });
 
-// ===== Endpoint principale =====
+// ==========================================
+// GENERA DOCUMENTO AI
+// ==========================================
 app.post('/api/genera', async (req, res) => {
   try {
     const { paziente, richiesta } = req.body;
@@ -349,7 +207,9 @@ app.post('/api/genera', async (req, res) => {
   }
 });
 
-// ===== Endpoint ask AI =====
+// ==========================================
+// ASK AI
+// ==========================================
 app.post('/api/ask', async (req, res) => {
   try {
     const { query, context } = req.body;
@@ -382,7 +242,9 @@ app.post('/api/ask', async (req, res) => {
   }
 });
 
-// ===== Health check =====
+// ==========================================
+// HEALTH CHECK
+// ==========================================
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -392,7 +254,6 @@ app.get('/health', (req, res) => {
       clientSecret: CLIENT_SECRET ? 'configurato' : 'mancante',
       refreshToken: REFRESH_TOKEN ? 'configurato' : 'mancante',
     },
-    supabase: process.env.SUPABASE_URL ? 'configurato' : 'mancante',
   });
 });
 
