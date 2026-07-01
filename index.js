@@ -14,14 +14,12 @@ const CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 
-// Client default (il tuo account)
 const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
 oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
 
 const drive = google.drive({ version: 'v3', auth: oauth2Client });
 const docs  = google.docs({  version: 'v1', auth: oauth2Client });
 
-// Token temporaneo per utente loggato
 let userTokens = null;
 
 // ===== Client Groq =====
@@ -35,7 +33,7 @@ console.log('Groq API Key:', process.env.GROQ_API_KEY ? 'OK' : 'MANCANTE');
 console.log('-------------------');
 
 // ==========================================
-// LOGIN GOOGLE - SCEGLI ACCOUNT
+// LOGIN GOOGLE
 // ==========================================
 app.get('/api/google/login', (req, res) => {
   const authClient = new google.auth.OAuth2(
@@ -43,7 +41,6 @@ app.get('/api/google/login', (req, res) => {
     CLIENT_SECRET,
     'https://studio-backend-kzx7.onrender.com/api/google/callback-web'
   );
-  
   const authUrl = authClient.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
@@ -52,7 +49,6 @@ app.get('/api/google/login', (req, res) => {
       'https://www.googleapis.com/auth/documents',
     ],
   });
-  
   res.redirect(authUrl);
 });
 
@@ -61,30 +57,23 @@ app.get('/api/google/login', (req, res) => {
 // ==========================================
 app.get('/api/google/callback-web', async (req, res) => {
   const { code } = req.query;
-  
-  if (!code) {
-    return res.send('<h1 style="color:red;">Errore: codice mancante</h1>');
-  }
-  
+  if (!code) return res.send('<h1 style="color:red;">Errore: codice mancante</h1>');
+
   try {
     const authClient = new google.auth.OAuth2(
       CLIENT_ID,
       CLIENT_SECRET,
       'https://studio-backend-kzx7.onrender.com/api/google/callback-web'
     );
-    
     const { tokens } = await authClient.getToken(code);
-    
-    // Salva i token dell'utente
     userTokens = tokens;
-    
+
     const userAuth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
     userAuth.setCredentials(tokens);
     const userDrive = google.drive({ version: 'v3', auth: userAuth });
     const files = await userDrive.files.list({ pageSize: 20, fields: 'files(name)' });
-    
     const fileList = (files.data.files || []).map(f => '<li>📄 ' + f.name + '</li>').join('');
-    
+
     res.send(
       '<html><head><style>body{font-family:sans-serif;padding:30px;text-align:center;}ul{text-align:left;max-width:400px;margin:20px auto;}</style></head>' +
       '<body>' +
@@ -101,31 +90,44 @@ app.get('/api/google/callback-web', async (req, res) => {
 });
 
 // ==========================================
-// LISTA FILE DRIVE (utente loggato o default)
+// LISTA FILE DRIVE — ora supporta ?folderId=
 // ==========================================
 app.get('/api/drive/files', async (req, res) => {
   try {
-    let driveClient = drive; // default: il tuo
-    
-    // Se c'è un utente loggato, usa il suo
+    let driveClient = drive;
     if (userTokens) {
       const userAuth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
       userAuth.setCredentials(userTokens);
       driveClient = google.drive({ version: 'v3', auth: userAuth });
     }
-    
+
+    // Se viene passato ?folderId= mostra il contenuto di quella cartella,
+    // altrimenti mostra la root (My Drive)
+    const folderId = req.query.folderId || 'root';
+    const query = `'${folderId}' in parents and trashed = false`;
+
     const response = await driveClient.files.list({
-      pageSize: 50,
+      q: query,
+      pageSize: 100,
       fields: 'files(id, name, mimeType, size, modifiedTime, webViewLink)',
-      orderBy: 'modifiedTime desc',
+      orderBy: 'folder,name', // cartelle prima, poi file in ordine alfabetico
     });
-    
-    res.json({ 
-      success: true, 
-      files: response.data.files || [] 
-    });
-    
+
+    const files = (response.data.files || []).map(f => ({
+      id: f.id,
+      name: f.name,
+      mimeType: f.mimeType,
+      size: f.size,
+      modifiedTime: f.modifiedTime,
+      webViewLink: f.webViewLink,
+      // true se è una cartella, così il frontend può distinguerla
+      isFolder: f.mimeType === 'application/vnd.google-apps.folder',
+    }));
+
+    res.json({ success: true, files, folderId });
+
   } catch (error) {
+    console.error('Errore /api/drive/files:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -136,35 +138,34 @@ app.get('/api/drive/files', async (req, res) => {
 app.get('/api/drive/download/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
-    
     let driveClient = drive;
     if (userTokens) {
       const userAuth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET);
       userAuth.setCredentials(userTokens);
       driveClient = google.drive({ version: 'v3', auth: userAuth });
     }
-    
+
     const metadata = await driveClient.files.get({
-      fileId: fileId,
+      fileId,
       fields: 'name, mimeType',
     });
-    
+
     const file = await driveClient.files.get(
       { fileId, alt: 'media' },
       { responseType: 'stream' }
     );
-    
+
     res.setHeader('Content-Type', metadata.data.mimeType || 'application/octet-stream');
     res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(metadata.data.name || 'file') + '"');
     file.data.pipe(res);
-    
+
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 // ==========================================
-// LOGOUT (torna al drive default)
+// LOGOUT
 // ==========================================
 app.get('/api/google/logout', (req, res) => {
   userTokens = null;
@@ -177,7 +178,6 @@ app.get('/api/google/logout', (req, res) => {
 app.post('/api/genera', async (req, res) => {
   try {
     const { paziente, richiesta } = req.body;
-
     if (!paziente || !paziente.nome || !paziente.cognome) {
       return res.status(400).json({ success: false, error: 'Dati paziente mancanti.' });
     }
@@ -216,6 +216,7 @@ app.post('/api/genera', async (req, res) => {
     res.json({ success: true, url: info.data.webViewLink });
 
   } catch (error) {
+    console.error('Errore /api/genera:', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -241,6 +242,7 @@ app.post('/api/ask', async (req, res) => {
     res.json({ answer: completion.choices[0]?.message?.content?.trim() ?? 'Nessuna risposta.' });
 
   } catch (error) {
+    console.error('Errore /api/ask:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
